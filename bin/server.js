@@ -1,17 +1,18 @@
 var dnode = require('dnode');
 var net = require('net');
 
-//setup redis connection
+//setup redis connection on localhost, standard port
 var redis = require("redis"),
     client = redis.createClient();
 client.on("error", function (err) {
   console.log("Error " + err);
 });
 
-var sleep = require('sleep');
+
 var http = require('http');
 
-//for testing
+//for JMeter-Test
+/*
 var serverx = http.createServer(function (req, res) {
   res.writeHead(200, {'Content-Type' : 'text/plain'});
   getDeviceData("Stromking1@ServerA", "Device", "ServerB", function (err, result){
@@ -22,6 +23,7 @@ var serverx = http.createServer(function (req, res) {
 
 // Listen to a specified port, or default to 8000
 serverx.listen(8000);
+*/
 
 
 
@@ -29,12 +31,11 @@ serverx.listen(8000);
 
 
 
-
-//create local Bus
+//create local Bus, done at every server start
 var localPSQueue;
 var httpServer = http.createServer(); // create the http server to serve as the federation server. you can also use express if you like...
 httpServer.listen(8881);
-var Bus = require('busmq');
+var Bus = require('busmq'); //options for local bus
 var options = {
   redis: 'redis://127.0.0.1', // connect this bus to a local running redis
   //logger: console,
@@ -58,6 +59,7 @@ bus.connect();
 
 
 //set up listening socket for RPCRequests on Port 5004
+//call requested function und use callback function with result
 var server = net.createServer(function (c) {
   var d = dnode({
     getDeviceData : function (service, device, cb) {
@@ -79,26 +81,24 @@ var server = net.createServer(function (c) {
       unsubscribe(service, device, ServerName, function (err, result){
         cb(result);
       })
-
     }
   });
   c.pipe(d).pipe(c);
 });
 server.listen(5004);
 
-// if you'd like to select database 3, instead of 0 (default), call
-// client.select(3, function() { /* ... */ });
 
-
-
-
-//argumente aufnehmen, ServerNamen setzen
+//slice the console arguments on server start. if first argument is set, it will become the server name, else "ServerA" as default
+//with no arguments, serverName has to been set manually before starting transactions
 var args= process.argv.slice(2);
-var ServerName =args[0];
+var ServerName="ServerA"; //defaultServerName: "ServerA"
+if (args.length>0) {
+  ServerName = args[0];
+}
 
-//publish queues
+//publish queues, array of all PublishQueues that get federated
 var PublishQueues = {};
-//rpcchannel
+//rpcchannel, all rpcqueues to other servers
 var RPCChannel ={};
 
 
@@ -108,19 +108,19 @@ var RPCChannel ={};
 function addTrustedCloud(name, ip){
   client.hset("server:"+name, "ip", ip); //Cloud in Redis speichern
 
-  //empfangsqueue erstellen
+  //create Subscribe-Queue
   var q = bus.queue(name+"."+ServerName);
   q.on('attached', function() {
     console.log('attached to queue. messages will soon start flowing in...');
   });
   q.on('message', function(message, id) {
     console.log('Publish von '+name+': ' + message);
-    // subscribe nachrichten
+    // Publish msg received
   });
   q.attach();
   q.consume(); // the 'message' event will be fired when a message is retrieved
 
-  //Bus für PublishNachrichten erstellen
+  //create new bus for federated queue
   var options = {
     logger: console,
     logLevel: 'debug',
@@ -130,17 +130,23 @@ function addTrustedCloud(name, ip){
       secret: 'mysecret'  // the secret ket to authorize with the federation server
     }
   };
-  var federatedBus = Bus.create(options);
-  var fed = federatedBus.federate(bus.queue(ServerName+"."+name), 'http://'+ip+':8881/my/fed/path');
 
-  fed.on('ready', function(q) {
-    // federation is ready - we can start using the queue
-    q.on('attached', function() {
-      // do whatever
+  var federatedBus = Bus.create(options);
+  federatedBus.on('online', function() {
+    //create the queue to be federated
+    var fed = federatedBus.federate(bus.queue(ServerName + "." + name), 'http://' + ip + ':8881/my/fed/path');
+
+    fed.on('ready', function (q) {
+      // federation is ready - we can start using the queue
+      q.on('attached', function () {
+        // do whatever
+      });
+      q.attach();
+      PublishQueues[name] = q;
     });
-    q.attach();
-    PublishQueues[name]=q;
-  });
+  })
+  federatedBus.on('error', function(e){
+    console.log("Keine Verbindung zum Zielserver möglich")})
 
   //setup RPCQueue
   var d = dnode();
@@ -148,24 +154,41 @@ function addTrustedCloud(name, ip){
     RPCChannel[name]=remote;
   })
   var c = net.connect(5004,ip);
+  c.on('error', function(err){
+    console.log("Keine Verbindung zur RPCQueue möglich: "+err);
+  })
   c.pipe(d).pipe(c);
+
 }
 
-//add new local Service
+
+/**
+ * add new local Service
+ * @param name -name of the new Service
+ */
 function addService(name){
   client.sadd("services", name);
 }
-//local Services
+
+
+/**
+ * get local Services
+ * @param callback -called to return results
+ */
 function getLocalServices(callback){
   client.smembers("services", function(err,obj){
     callback(null, obj+" @"+ServerName);
   });
 }
 
-//get all services
-// warten auf Ausgabe 1 Sekunde!
+
+/**
+ * get all services, wait 1s for all results
+ * @param callback -called to return results
+ */
 function getServices(callback) {
   var localServices="";
+  //get all Services of connected clouds
   for (var key in RPCChannel){
     if(RPCChannel.hasOwnProperty(key)){
       RPCChannel[key].getServices('beep', function (s) {
@@ -173,6 +196,7 @@ function getServices(callback) {
       });
     }
   }
+  //add local services to the list
   getLocalServices( function(err,result){
     localServices=localServices+ " -- "+result;
   })
@@ -181,18 +205,32 @@ function getServices(callback) {
   }, 1000);
 }
 
-//create a User+Data für Device 1
+
+/**
+ * creates a user and sets his device
+ * @param name -name of new user
+ * @param device -name of his device
+ */
 function createUser(name, device){
   client.set("user:"+name, device);
 }
 
-//create Device
+
+/**
+ * creates a device
+ * @param name -name of the new device
+ * @param data -data of the new device
+ */
 function createDevice(name, data){
-  // client.hmset("device:"+ name, "Data", data, "Access", [], "Subscribed", [], redis.print);
-  client.hmset("device:"+ name, "Data", data);
+    client.hmset("device:"+ name, "Data", data);
 }
 
-//setData on User:Device:Data
+
+/**
+ * setData on device, check if there are subscribers, if yes, publish the data change
+ * @param device -name of the device
+ * @param data -data value
+ */
 function setData(device, data){
   client.hset("device:"+device, "Data", data);
   getSubscribers(device, function(err, result){
@@ -205,15 +243,25 @@ function setData(device, data){
         if(help[1]==ServerName){
           localPSQueue.push(msg);
         }
-        else{ console.log("server:" +help[1]);
-          PublishQueues[help[1]].push(msg);
+        else{
+          //publish to target server
+          try {
+            PublishQueues[help[1]].push(msg);
+          }
+          catch(err){console.log("Subscriber nicht verbunden");}
         }
       })
     };
   })
-
 }
-//getData from User:Device:Data
+
+
+/**
+ * get data from local device
+ * @param service -name of the requesting service
+ * @param device -name of the device
+ * @param callback -called to return result
+ */
 function getLocalData(service, device, callback){
   var array =[];
   getServiceAccess(device, function(err, obj) {
@@ -229,7 +277,14 @@ function getLocalData(service, device, callback){
   })
 }
 
-//get Data allgemein
+
+/**
+ * get data from any device, checks if the device is on the local server, else requests the data on target server
+ * @param service -name of the requesting service
+ * @param device -name of the device
+ * @param target -target server
+ * @param callback -called to return result
+ */
 function getDeviceData(service, device, target, callback){
   if(target===ServerName){
     getLocalData(service, device, function (err, result){
@@ -237,15 +292,21 @@ function getDeviceData(service, device, target, callback){
     })
   }
   else {
-    RPCChannel[target].getDeviceData(service, device, function (s) {
-      callback(null, s);
-    });
+    if(typeof RPCChannel[target]!= 'undefined') {
+      RPCChannel[target].getDeviceData(service, device, function (s) {
+        callback(null, s);
+      });
+    }
+    else callback(null, "Keine Verbindung zum Ziel vorhanden");
   }
 }
 
 
-
-//getServiceAccess
+/**
+ * returns every service that has access to the device
+ * @param device -name of the device
+ * @param callback -called to return result
+ */
 function getServiceAccess(device, callback){
   client.hget("device:"+device, "Access", function(err,obj){
     var result = [];
@@ -256,7 +317,13 @@ function getServiceAccess(device, callback){
   });
 }
 
-//setServiceAccess
+
+/**
+ * grant service access to a service
+ * @param device -name of the device
+ * @param service -name of the service
+ * @param callback -called to return result
+ */
 function setServiceAccess(device, service, callback){
   getServiceAccess(device, function(err,result){
     result.push(service);
@@ -265,7 +332,12 @@ function setServiceAccess(device, service, callback){
   });
 }
 
-//remove Service Access
+
+/**
+ * remove service access
+ * @param device -name of the device
+ * @param service -name of the service
+ */
 function removeServiceAccess(device, service){
   getServiceAccess(device, function(err,result){
     var newArray=[];
@@ -284,7 +356,12 @@ function removeServiceAccess(device, service){
 
 }
 
-//getSubscribers
+
+/**
+ * get all active subscribers
+ * @param device -name of the device
+ * @param callback -called to return result
+ */
 function getSubscribers(device, callback){
   client.hget("device:"+device, "Subscribed", function(err,obj){
     var result=[];
@@ -296,7 +373,13 @@ function getSubscribers(device, callback){
 }
 
 
-//set Service Subscription
+/**
+ * set service subscription
+ * @param service -name of the service
+ * @param device -name of the device
+ * @param target -target server
+ * @param callback -called to return result
+ */
 function subscribe(service, device, target, callback){
   if(target===ServerName){
     getServiceAccess(device, function(err, result){
@@ -307,8 +390,7 @@ function subscribe(service, device, target, callback){
         })
 
         callback(null, "OK");
-        //createSubscriber(username, device, service);
-        //device not defined
+
       }
       else {callback(null,"Keine Zugriffsberechtigung")}
     })
@@ -323,26 +405,43 @@ function subscribe(service, device, target, callback){
   }
 }
 
-//unsubscribe
-function unsubscribe(service, device, target, callback){
-  if (target==ServerName){
-    getSubscribers(device, function(err,result){
-      var newArray=[];
-      result.forEach(function(eservice){
-        if(eservice!=service) newArray.push(eservice);
+
+/**
+ * unsubscribe
+ * @param service -name of the service
+ * @param device -device name of the device
+ * @param target -target server
+ * @param callback -call to return result
+ */
+function unsubscribe(service, device, target, callback) {
+  if (target == ServerName) {
+    getSubscribers(device, function (err, result) {
+      var newArray = [];
+      result.forEach(function (eservice) {
+        if (eservice != service) newArray.push(eservice);
       })
-      client.hset("device:"+device, "Subscribed", newArray);
+      client.hset("device:" + device, "Subscribed", newArray);
       callback(null, "OK");
     })
   }
   else {
-    RPCChannel[target].unsubscribe(service, device, function (s) {
-      callback(null,s);
-    })
+    try {
+      RPCChannel[target].unsubscribe(service, device, function (s) {
+        callback(null, s);
+      })
+    }
+    catch (err) {
+      callback(null, "Keine Verbindung zum Zielserver vorhanden");
+    }
   }
 }
 
-//get Watchers/WatcherAwareness
+
+/**
+ * WatcherAwareness
+ * @param device -name of the device
+ * @param callback -call to return result
+ */
 function discoverFollowers(device, callback){
   getSubscribers(device, function(err, result){
     callback(null, result);
@@ -350,34 +449,15 @@ function discoverFollowers(device, callback){
 }
 
 
+
+
+
 /*
- //send message
- function sendMessage(username, target, type, message){
-
- var id = ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {var r = Math.random()*16|0,v=c=='x'?r:r&0x3|0x8;return v.toString(16);}));
- var msg = {user:username, type:target, id: id , message:message};
- JSON.stringify(msg);
- console.log("Message sent: "+msg.toString());
- PublishQueues[target].push(msg);
-
-
- }
-
- function sendRequest(service, device, target, type, message){
- var id = ('xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {var r = Math.random()*16|0,v=c=='x'?r:r&0x3|0x8;return v.toString(16);}));
- var msg = {sender:sender, type:type, id: id, message:message};
- console.log("Message: "+msg["sender"]);
- //JSON.stringify(msg);
- PublishQueues[target].push(msg);
- }*/
-
-
-
 //Tests
-/*
+
 client.flushdb();
 
-addTrustedCloud(args[1], args[2]);
+//addTrustedCloud(args[1], args[2]);
 addService("Stromking1");
 addService("Stromking2");
 createDevice("Device", 10);
@@ -393,7 +473,7 @@ setTimeout(function() {
 
 setTimeout(function() {
 
-  subscribe("Stromking1@ServerA", "Device", "ServerA", function(err, result){
+  unsubscribe("Stromking1@ServerA", "Device", "ServerB", function(err, result){
     console.log(result);
   })
   getDeviceData("Stromking1@ServerA", "Device", "ServerA", function (err, result){
@@ -404,12 +484,11 @@ setTimeout(function() {
 
 
 setTimeout(function() {
-  for(var i=0; i<5000; i++)
-  {
-    getDeviceData("Stromking1@ServerA", "Device", "ServerA", function (err, result) {
-      console.log(i+" "+result);
+
+    getDeviceData("Stromking1@ServerA", "Device", "ServerB", function (err, result) {
+      console.log(result);
     })
-  }
+
 
 }, 5000);
 
